@@ -7,11 +7,23 @@ import logging
 
 logger = logging.getLogger("audio_to_day_plan_bot.storage")
 
+from typing import Optional
+
 class BaseStorage(abc.ABC):
     """Abstract class for note storage providers (Yandex Disk, Google Drive, etc.)."""
     @abc.abstractmethod
     def save_day_plan(self, filename: str, structured_plan: str, today_str: str) -> bool:
         """Saves or appends structured plan to today's note."""
+        pass
+
+    @abc.abstractmethod
+    def get_day_plan(self, filename: str) -> Optional[str]:
+        """Reads current day plan content if it exists."""
+        pass
+
+    @abc.abstractmethod
+    def save_day_plan_raw(self, filename: str, content: str) -> bool:
+        """Overwrites or saves the final raw plan content."""
         pass
 
 class YandexWebDAVStorage(BaseStorage):
@@ -51,6 +63,23 @@ class YandexWebDAVStorage(BaseStorage):
         r_put = requests.put(
             yandex_file_url,
             data=new_content.encode("utf-8"),
+            auth=self.auth,
+            headers={"Content-Type": "text/markdown; charset=utf-8"}
+        )
+        return r_put.status_code in (200, 201, 204)
+
+    def get_day_plan(self, filename: str) -> Optional[str]:
+        yandex_file_url = f"{self.webdav_url}{self.obsidian_dir}/{filename}"
+        r_get = requests.get(yandex_file_url, auth=self.auth)
+        if r_get.status_code == 200:
+            return r_get.content.decode("utf-8")
+        return None
+
+    def save_day_plan_raw(self, filename: str, content: str) -> bool:
+        yandex_file_url = f"{self.webdav_url}{self.obsidian_dir}/{filename}"
+        r_put = requests.put(
+            yandex_file_url,
+            data=content.encode("utf-8"),
             auth=self.auth,
             headers={"Content-Type": "text/markdown; charset=utf-8"}
         )
@@ -120,5 +149,26 @@ class GoogleDriveStorage(BaseStorage):
                 'parents': [self.folder_id]
             }
             media = MediaInMemoryUpload(new_content.encode('utf-8'), mimetype='text/markdown', resumable=True)
+            self.service.files().create(body=file_metadata, media_body=media, fields='id').execute()
+        return True
+
+    def get_day_plan(self, filename: str) -> Optional[str]:
+        file_id = self._find_file(filename)
+        if file_id:
+            return self._get_file_content(file_id)
+        return None
+
+    def save_day_plan_raw(self, filename: str, content: str) -> bool:
+        from googleapiclient.http import MediaInMemoryUpload
+        file_id = self._find_file(filename)
+        if file_id:
+            media = MediaInMemoryUpload(content.encode('utf-8'), mimetype='text/markdown', resumable=True)
+            self.service.files().update(fileId=file_id, media_body=media).execute()
+        else:
+            file_metadata = {
+                'name': filename,
+                'parents': [self.folder_id]
+            }
+            media = MediaInMemoryUpload(content.encode('utf-8'), mimetype='text/markdown', resumable=True)
             self.service.files().create(body=file_metadata, media_body=media, fields='id').execute()
         return True

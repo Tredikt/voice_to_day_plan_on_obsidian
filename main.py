@@ -83,32 +83,45 @@ async def handle_voice(message: Message):
             await status_msg.edit_text("🤷‍♂️ Речь не распознана.")
             return
 
-        await status_msg.edit_text("🧠 Структурирую список задач через ИИ...")
+        await status_msg.edit_text("🧠 Определяю дату и структуру списка задач...")
 
-        # 3. Generate structured Markdown plan and extract calendar events
-        structured_plan, calendar_events = llm.generate_day_plan(
+        # 3. Parse target date
+        target_date = llm.parse_target_date(
             raw_text=raw_text,
             openai_api_key=config.OPENAI_API_KEY,
             deepseek_api_key=config.DEEPSEEK_API_KEY
         )
+        filename = f"{target_date}.md"
 
-        # 4. Save to cloud storage (Obsidian vault)
+        # 4. Check if file exists in our storage
         if not store:
             await status_msg.edit_text("❌ Хранилище не инициализировано. Проверьте настройки в .env")
             return
 
-        today_str = datetime.date.today().strftime("%Y-%m-%d")
-        filename = f"{today_str}.md"
-        
+        existing_content = store.get_day_plan(filename)
+        if existing_content:
+            logger.info("Existing day plan found for %s. Passing to LLM for merging/editing...", target_date)
+        else:
+            logger.info("No existing day plan found for %s. Will generate a new one.", target_date)
+
+        # 5. Generate or update structured Markdown plan and extract calendar events
+        structured_plan, calendar_events = llm.generate_day_plan(
+            raw_text=raw_text,
+            openai_api_key=config.OPENAI_API_KEY,
+            deepseek_api_key=config.DEEPSEEK_API_KEY,
+            existing_content=existing_content,
+            target_date=target_date
+        )
+
         await status_msg.edit_text("💾 Сохраняю в облако...")
-        success = store.save_day_plan(filename, structured_plan, today_str)
+        success = store.save_day_plan_raw(filename, structured_plan)
 
         if success:
-            # 5. Handle Google Calendar events if any
+            # 6. Handle Google Calendar events if any
             added_events_info = []
             if calendar_events and cal_manager:
                 try:
-                    await status_msg.edit_text("📅 Создаю события в Google Календаре...")
+                    await status_msg.edit_text("📅 Синхронизирую события в Google Календаре...")
                 except Exception:
                     pass
                 for ev in calendar_events:
@@ -117,14 +130,17 @@ async def handle_voice(message: Message):
                     end_time = ev.get("end_time")
                     if summary and start_time:
                         try:
-                            cal_manager.create_event(summary, today_str, start_time, end_time)
-                            added_events_info.append(f"• *{summary}* в {start_time}")
+                            event_data, status = cal_manager.create_or_update_event(
+                                summary, target_date, start_time, end_time
+                            )
+                            status_ru = "обновлено" if status == "updated" else "создано"
+                            added_events_info.append(f"• *{summary}* в {start_time} ({status_ru})")
                         except Exception as e:
-                            logger.error("Failed to add event %s to calendar: %s", summary, e)
+                            logger.error("Failed to add/update event %s to calendar: %s", summary, e)
             
             calendar_suffix = ""
             if added_events_info:
-                calendar_suffix = "\n\n📅 **Добавлено в Google Календарь:**\n" + "\n".join(added_events_info)
+                calendar_suffix = "\n\n📅 **События в Google Календаре:**\n" + "\n".join(added_events_info)
 
             response_text = (
                 f"✅ *Успешно сохранено в Obsidian!*\n"
