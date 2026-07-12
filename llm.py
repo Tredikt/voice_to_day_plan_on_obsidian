@@ -59,12 +59,10 @@ def transcribe_audio(file_path: str, openai_api_key: str) -> str:
         # Fallback to local transcription using free SpeechRecognition
         return transcribe_audio_locally(file_path)
 
-def parse_target_date(raw_text: str, openai_api_key: str, deepseek_api_key: str) -> str:
+def classify_intent(raw_text: str, openai_api_key: str, deepseek_api_key: str) -> dict:
     """
-    Analyzes the transcribed text to find the target date the user is referring to.
-    Today's date is dynamically provided in the prompt.
-    Returns:
-        target_date: str in 'YYYY-MM-DD' format.
+    Classifies the user's message to determine if they want to READ a file or WRITE/UPDATE a file.
+    Also extracts the target filename, parsing relative dates if necessary.
     """
     import datetime
     from zoneinfo import ZoneInfo
@@ -86,16 +84,24 @@ def parse_target_date(raw_text: str, openai_api_key: str, deepseek_api_key: str)
     ru_day = ru_days.get(day_of_week, day_of_week)
 
     prompt = (
-        "Ты — точный ИИ-ассистент для определения дат.\n"
-        "Проанализируй текст голосовой заметки и определи целевую дату, о которой идет речь.\n\n"
-        f"Текущая дата (сегодня): {today_str} ({ru_day}).\n\n"
-        "Правила:\n"
-        "1. Если в тексте явно или косвенно упоминается 'на завтра' / 'завтра', верни дату завтрашнего дня.\n"
-        "2. Если упоминается конкретный день недели (например, 'в понедельник', 'на пятницу'), найди ближайшую будущую дату для этого дня недели.\n"
-        "3. Если упоминается конкретное число (например, 'на 15 число', 'на 20 июля'), верни соответствующую дату текущего или ближайшего будущего месяца/года.\n"
-        "4. Если в тексте нет указаний на конкретную дату или явно упоминается 'сегодня' / 'на сегодня', верни текущую дату (сегодня).\n"
-        "5. Ответ должен быть СТРОГО в формате JSON с одним ключом \"target_date\" (значение в формате \"YYYY-MM-DD\").\n\n"
-        f"Текст голосовой заметки:\n\"{raw_text}\""
+        "Ты — управляющий ИИ-ассистент для Obsidian.\n"
+        "Проанализируй запрос пользователя (текстовый или голосовой) и определи:\n"
+        "1. Действие (action): 'read' (если пользователь просит показать, прочитать, открыть, найти или вывести содержимое файла) "
+        "или 'write' (если пользователь просит создать файл, записать, добавить задачу, изменить, удалить, перепланировать или обновить план).\n"
+        "2. Имя файла (filename): имя файла с расширением '.md' (например, 'Идеи.md', 'Рецепты.md').\n\n"
+        f"Текущая дата (сегодня): {today_str} ({ru_day}).\n"
+        "Правила для определения имени файла:\n"
+        "- Если пользователь имеет в виду план на день ('планы на завтра', 'задачи на сегодня', 'что у меня на пятницу', или просто диктует задачу без указания конкретного файла), "
+        "используй дату в формате 'YYYY-MM-DD.md' (например, '2026-07-12.md' для сегодня, '2026-07-13.md' для завтра).\n"
+        "- Если пользователь явно указывает другое имя файла (например, 'добавь в файл Идеи.md...', 'покажи файл Рецепты'), используй это имя с расширением '.md' (например, 'Идеи.md', 'Рецепты.md').\n"
+        "- Всегда добавляй расширение '.md', если его нет.\n\n"
+        "Выдай ответ СТРОГО в формате JSON со следующими ключами:\n"
+        "{\n"
+        "  \"action\": \"read\",\n"
+        "  \"filename\": \"имя_файла.md\",\n"
+        "  \"target_date\": \"YYYY-MM-DD\" (только если файл относится к конкретной дате плана на день, иначе null)\n"
+        "}\n\n"
+        f"Запрос пользователя:\n\"{raw_text}\""
     )
 
     if deepseek_api_key:
@@ -111,23 +117,32 @@ def parse_target_date(raw_text: str, openai_api_key: str, deepseek_api_key: str)
         completion = client.chat.completions.create(
             model=model_name,
             messages=[
-                {"role": "system", "content": "Ты парсишь даты и возвращаешь JSON."},
+                {"role": "system", "content": "Ты классифицируешь запросы к файлам Obsidian и возвращаешь JSON."},
                 {"role": "user", "content": prompt}
             ],
             response_format={"type": "json_object"}
         )
         res_json = json.loads(completion.choices[0].message.content)
-        return res_json.get("target_date", today_str)
+        return {
+            "action": res_json.get("action", "write"),
+            "filename": res_json.get("filename", f"{today_str}.md"),
+            "target_date": res_json.get("target_date")
+        }
     except Exception as e:
-        logger.error("Failed to parse target date, falling back to today (%s): %s", today_str, e)
-        return today_str
+        logger.error("Failed to classify intent, falling back to write today: %s", e)
+        return {
+            "action": "write",
+            "filename": f"{today_str}.md",
+            "target_date": today_str
+        }
 
 def generate_day_plan(
     raw_text: str, 
     openai_api_key: str, 
     deepseek_api_key: str,
     existing_content: str = None,
-    target_date: str = None
+    target_date: str = None,
+    filename: str = None
 ) -> tuple[str, list]:
     """
     Generates or updates structured Obsidian Markdown and extracts events for Google Calendar from voice text.
@@ -141,46 +156,67 @@ def generate_day_plan(
     tz = ZoneInfo(config.TIMEZONE)
     now_tz = datetime.datetime.now(tz)
     
-    if not target_date:
-        target_date = now_tz.strftime("%Y-%m-%d")
+    if not filename:
+        if target_date:
+            filename = f"{target_date}.md"
+        else:
+            filename = f"{now_tz.strftime('%Y-%m-%d')}.md"
 
-    prompt = (
-        "Ты — умный личный ассистент. Проанализируй транскрипцию голосовой заметки "
-        f"и составь/обнови план действий на {target_date} для Obsidian, а также выдели события с конкретным временем для Google Календаря.\n\n"
-    )
+    is_daily_plan = bool(target_date)
+
+    prompt = "Ты — умный личный ассистент Obsidian.\n"
+    if is_daily_plan:
+        prompt += f"Ты создаешь или обновляешь план действий на {target_date} для файла '{filename}'."
+    else:
+        prompt += f"Ты создаешь или обновляешь заметку в файле '{filename}'."
+
+    prompt += "\n\n"
 
     if existing_content and existing_content.strip():
         prompt += (
-            f"Внимание! У пользователя уже есть существующий план на эту дату ({target_date}):\n"
+            f"Текущее содержимое файла '{filename}':\n"
             "```markdown\n"
             f"{existing_content}\n"
             "```\n\n"
-            "Пользователь хочет ДОБАВИТЬ новые задачи, ИЗМЕНИТЬ, СДВИНУТЬ или ЗАМЕНИТЬ существующие пункты на основе нового голосового сообщения.\n"
-            "Твоя задача — аккуратно объединить или обновить этот план:\n"
-            "1. Если пользователь говорит заменить, удалить или сдвинуть задачу/время, внеси эти изменения в существующий текст.\n"
-            "2. Если пользователь говорит добавить задачу, добаь её в список 'Выделенные задачи' (постарайся сохранить красивую структуру). "
-            "Если новые задачи не привязаны ко времени или это просто дополнения, ты можешь добавить их в список, либо создать в конце файла аккуратный подраздел:\n"
+            "Пользователь хочет ДОБАВИТЬ информацию, ИЗМЕНИТЬ, СДВИНУТЬ или ЗАМЕНИТЬ существующие разделы/пункты.\n"
+            "Твоя задача — аккуратно объединить изменения с существующим файлом:\n"
+            "1. Если пользователь просит заменить, удалить или изменить строку/задачу, внеси эти правки.\n"
+            "2. Если пользователь просит просто добавить информацию (задачу или мысль), найди логическое место в файле или создай новый подраздел в конце:\n"
             f"### 🕒 Дополнение от {now_tz.strftime('%H:%M')}\n"
-            "и описать изменения/дополнительный текст там.\n"
-            "3. Убери из названий задач глаголы действия вроде 'сделать', 'поставить', 'надо сходить' — пиши лаконично (например: '- [ ] Тренировка в 18:00', '- [ ] Созвон по дизайну').\n"
-            "4. In 'markdown' key return fully updated markdown file.\n\n"
+            "и опиши новые пункты/задачи там.\n"
+            "3. На выходе ты должен вернуть ПОЛНЫЙ обновленный текст файла markdown, который полностью перезапишет старое содержимое.\n"
         )
     else:
         prompt += (
-            "Для этой даты еще НЕТ существующего плана. Создай новый чистый план на русском языке с нуля.\n"
-            "Формат для Obsidian:\n"
-            "## 🚀 Выделенные задачи\n"
-            "- [ ] [Задача 1]\n"
-            "- [ ] [Задача 2]\n\n"
-            "## 📝 Расшифровка записи\n"
-            "> [Красиво отредактированный текст голосовой заметки]\n\n"
-            "Правила:\n"
-            "1. Пиши лаконично и строго по делу, без вступительных или заключительных фраз.\n"
-            "2. В 'Выделенные задачи' убирай слова вроде 'Сделать', 'Поставить', пиши кратко (например: '- [ ] Тренировка в 18:00', '- [ ] Созвон по дизайну').\n\n"
+            f"Файла '{filename}' еще нет. Создай его содержимое с нуля.\n"
+        )
+        if is_daily_plan:
+            prompt += (
+                "Используй следующий стандартный формат для дневного плана:\n"
+                "## 🚀 Выделенные задачи\n"
+                "- [ ] [Задача 1]\n"
+                "- [ ] [Задача 2]\n\n"
+                "## 📝 Расшифровка записи\n"
+                "> [Красиво отредактированный текст голосовой заметки]\n\n"
+            )
+        else:
+            prompt += (
+                "Создай красивую структуру заметок в формате Markdown, основываясь на пожеланиях пользователя.\n"
+                "Обязательно добавь заголовок первого уровня `#` и красивые списки.\n"
+            )
+
+    if is_daily_plan:
+        prompt += (
+            "Обязательно выдели события для Google Календаря. Каждое событие должно иметь время начала.\n"
+        )
+    else:
+        prompt += (
+            "Если в запросе пользователя явно упоминаются события с точным временем и датой, которые нужно занести в календарь, выдели их. "
+            "В остальных случаях верни пустой список для calendar_events.\n"
         )
 
     prompt += (
-        "Выдай ответ СТРОГО в формате JSON с двумя ключами:\n"
+        "\nВыдай ответ СТРОГО в формате JSON с двумя ключами:\n"
         "1. \"markdown\": Полный текст плана для Obsidian (в формате markdown).\n"
         "2. \"calendar_events\": Список событий для Google Календаря на эту дату. Каждое событие должно содержать:\n"
         "   - \"summary\": Очищенное, короткое существительное название события на русском языке с большой буквы. "

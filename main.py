@@ -57,6 +57,157 @@ def _make_bot_session(proxy_url: str):
     return AiohttpSession(proxy=proxy_url)
 
 
+@dp.message(F.text & F.text.startswith('/start'))
+async def cmd_start(message: Message):
+    user_id = message.from_user.id
+    if config.ALLOWED_TELEGRAM_IDS and user_id not in config.ALLOWED_TELEGRAM_IDS:
+        logger.warning("Access denied for user ID: %d", user_id)
+        return
+    await message.reply(
+        "👋 Привет! Я твой персональный ИИ-ассистент для Obsidian и Google Календаря.\n\n"
+        "Я могу работать как с **голосовыми**, так и с **текстовыми** сообщениями.\n\n"
+        "**Примеры команд:**\n"
+        "• *Создание планов:* «Запиши на завтра в 15:00 созвон по проекту и добавь тренировку»\n"
+        "• *Чтение файлов:* «Покажи планы на завтра» или «Покажи, что в файле Рецепты.md»\n"
+        "• *Произвольные заметки:* «Добавь в файл Идеи.md пункт купить кофе» или «Создай файл Заметки с текстом привет мир»"
+    )
+
+async def process_user_request(message: Message, raw_text: str, is_voice: bool):
+    user_id = message.from_user.id
+    if config.ALLOWED_TELEGRAM_IDS and user_id not in config.ALLOWED_TELEGRAM_IDS:
+        logger.warning("Access denied for user ID: %d", user_id)
+        return
+
+    status_msg = await message.answer("🧠 Анализирую запрос...")
+    
+    try:
+        # 1. Classify user intent
+        intent = llm.classify_intent(
+            raw_text=raw_text,
+            openai_api_key=config.OPENAI_API_KEY,
+            deepseek_api_key=config.DEEPSEEK_API_KEY
+        )
+        
+        action = intent.get("action", "write")
+        filename = intent.get("filename", f"unnamed.md")
+        target_date = intent.get("target_date")
+
+        if not store:
+            await status_msg.edit_text("❌ Хранилище не инициализировано. Проверьте настройки в .env")
+            return
+
+        if action == "read":
+            await status_msg.edit_text(f"🔍 Ищу и читаю файл `{filename}`...")
+            content = store.get_day_plan(filename)
+            
+            if content and content.strip():
+                response_text = (
+                    f"📖 **Содержимое файла `{filename}`:**\n\n"
+                    f"{content}"
+                )
+                try:
+                    await message.reply(response_text, parse_mode="Markdown")
+                    try:
+                        await status_msg.delete()
+                    except Exception:
+                        pass
+                except Exception as e:
+                    logger.warning("Failed to send content in Markdown, falling back to plain text: %s", e)
+                    plain_response = (
+                        f"📖 Содержимое файла {filename}:\n\n"
+                        f"{content.replace('**', '').replace('*', '')}"
+                    )
+                    await message.reply(plain_response)
+                    try:
+                        await status_msg.delete()
+                    except Exception:
+                        pass
+            else:
+                await status_msg.edit_text(f"🤷‍♂️ Файл `{filename}` пуст или не найден в вашем Obsidian.")
+
+        elif action == "write":
+            await status_msg.edit_text(f"📝 Читаю текущую версию `{filename}`...")
+            existing_content = store.get_day_plan(filename)
+            
+            if existing_content:
+                logger.info("Existing content found for %s. Passing to LLM for merging/editing...", filename)
+            else:
+                logger.info("No existing content found for %s. Creating fresh file.", filename)
+
+            await status_msg.edit_text("🧠 Обрабатываю изменения через ИИ...")
+            structured_plan, calendar_events = llm.generate_day_plan(
+                raw_text=raw_text,
+                openai_api_key=config.OPENAI_API_KEY,
+                deepseek_api_key=config.DEEPSEEK_API_KEY,
+                existing_content=existing_content,
+                target_date=target_date,
+                filename=filename
+            )
+
+            await status_msg.edit_text("💾 Сохраняю в облако...")
+            success = store.save_day_plan_raw(filename, structured_plan)
+
+            if success:
+                # Handle calendar events if target_date and calendar integration exist
+                added_events_info = []
+                if calendar_events and cal_manager and target_date:
+                    try:
+                        await status_msg.edit_text("📅 Синхронизирую события в Google Календаре...")
+                    except Exception:
+                        pass
+                    for ev in calendar_events:
+                        summary = ev.get("summary")
+                        start_time = ev.get("start_time")
+                        end_time = ev.get("end_time")
+                        if summary and start_time:
+                            try:
+                                event_data, status = cal_manager.create_or_update_event(
+                                    summary, target_date, start_time, end_time
+                                )
+                                status_ru = "обновлено" if status == "updated" else "создано"
+                                added_events_info.append(f"• *{summary}* в {start_time} ({status_ru})")
+                            except Exception as e:
+                                logger.error("Failed to add/update event %s to calendar: %s", summary, e)
+                
+                calendar_suffix = ""
+                if added_events_info:
+                    calendar_suffix = "\n\n📅 **События в Google Календаре:**\n" + "\n".join(added_events_info)
+
+                response_text = (
+                    f"✅ *Успешно сохранено в Obsidian!*\n"
+                    f"📂 Файл: `{filename}`"
+                    f"{calendar_suffix}\n\n"
+                    f"{structured_plan}"
+                )
+                try:
+                    await message.reply(response_text, parse_mode="Markdown")
+                    try:
+                        await status_msg.delete()
+                    except Exception:
+                        pass
+                except Exception as e:
+                    logger.warning("Failed to send reply in Markdown, falling back to plain text: %s", e)
+                    plain_response = (
+                        f"✅ Успешно сохранено в Obsidian!\n"
+                        f"📂 Файл: {filename}"
+                        f"{calendar_suffix.replace('**', '').replace('*', '')}\n\n"
+                        f"{structured_plan}"
+                    )
+                    await message.reply(plain_response)
+                    try:
+                        await status_msg.delete()
+                    except Exception:
+                        pass
+            else:
+                await status_msg.edit_text("❌ Не удалось сохранить изменения в облако.")
+
+    except Exception as e:
+        logger.error("Error processing request: %s", e, exc_info=True)
+        try:
+            await status_msg.edit_text(f"❌ Произошла ошибка: {str(e)}")
+        except Exception:
+            await message.reply(f"❌ Произошла ошибка: {str(e)}")
+
 @dp.message(F.voice)
 async def handle_voice(message: Message):
     user_id = message.from_user.id
@@ -83,103 +234,28 @@ async def handle_voice(message: Message):
             await status_msg.edit_text("🤷‍♂️ Речь не распознана.")
             return
 
-        await status_msg.edit_text("🧠 Определяю дату и структуру списка задач...")
+        try:
+            await status_msg.delete()
+        except Exception:
+            pass
 
-        # 3. Parse target date
-        target_date = llm.parse_target_date(
-            raw_text=raw_text,
-            openai_api_key=config.OPENAI_API_KEY,
-            deepseek_api_key=config.DEEPSEEK_API_KEY
-        )
-        filename = f"{target_date}.md"
-
-        # 4. Check if file exists in our storage
-        if not store:
-            await status_msg.edit_text("❌ Хранилище не инициализировано. Проверьте настройки в .env")
-            return
-
-        existing_content = store.get_day_plan(filename)
-        if existing_content:
-            logger.info("Existing day plan found for %s. Passing to LLM for merging/editing...", target_date)
-        else:
-            logger.info("No existing day plan found for %s. Will generate a new one.", target_date)
-
-        # 5. Generate or update structured Markdown plan and extract calendar events
-        structured_plan, calendar_events = llm.generate_day_plan(
-            raw_text=raw_text,
-            openai_api_key=config.OPENAI_API_KEY,
-            deepseek_api_key=config.DEEPSEEK_API_KEY,
-            existing_content=existing_content,
-            target_date=target_date
-        )
-
-        await status_msg.edit_text("💾 Сохраняю в облако...")
-        success = store.save_day_plan_raw(filename, structured_plan)
-
-        if success:
-            # 6. Handle Google Calendar events if any
-            added_events_info = []
-            if calendar_events and cal_manager:
-                try:
-                    await status_msg.edit_text("📅 Синхронизирую события в Google Календаре...")
-                except Exception:
-                    pass
-                for ev in calendar_events:
-                    summary = ev.get("summary")
-                    start_time = ev.get("start_time")
-                    end_time = ev.get("end_time")
-                    if summary and start_time:
-                        try:
-                            event_data, status = cal_manager.create_or_update_event(
-                                summary, target_date, start_time, end_time
-                            )
-                            status_ru = "обновлено" if status == "updated" else "создано"
-                            added_events_info.append(f"• *{summary}* в {start_time} ({status_ru})")
-                        except Exception as e:
-                            logger.error("Failed to add/update event %s to calendar: %s", summary, e)
-            
-            calendar_suffix = ""
-            if added_events_info:
-                calendar_suffix = "\n\n📅 **События в Google Календаре:**\n" + "\n".join(added_events_info)
-
-            response_text = (
-                f"✅ *Успешно сохранено в Obsidian!*\n"
-                f"📂 Файл: `{filename}`"
-                f"{calendar_suffix}\n\n"
-                f"{structured_plan}"
-            )
-            try:
-                await message.reply(response_text, parse_mode="Markdown")
-                try:
-                    await status_msg.delete()
-                except Exception:
-                    pass
-            except Exception as e:
-                logger.warning("Failed to send reply in Markdown, falling back to plain text: %s", e)
-                plain_response = (
-                    f"✅ Успешно сохранено в Obsidian!\n"
-                    f"📂 Файл: {filename}"
-                    f"{calendar_suffix.replace('**', '').replace('*', '')}\n\n"
-                    f"{structured_plan}"
-                )
-                await message.reply(plain_response)
-                try:
-                    await status_msg.delete()
-                except Exception:
-                    pass
-        else:
-            await status_msg.edit_text("❌ Не удалось сохранить файл в облако.")
+        # 3. Delegate processing
+        await process_user_request(message, raw_text, is_voice=True)
 
     except Exception as e:
-        logger.error("Error processing voice message: %s", e, exc_info=True)
+        logger.error("Error transcribing voice message: %s", e, exc_info=True)
         try:
-            await status_msg.edit_text(f"❌ Произошла ошибка: {str(e)}")
+            await status_msg.edit_text(f"❌ Не удалось распознать аудио: {str(e)}")
         except Exception:
-            await message.reply(f"❌ Произошла ошибка: {str(e)}")
+            await message.reply(f"❌ Не удалось распознать аудио: {str(e)}")
         
     finally:
         if os.path.exists(local_ogg_path):
             os.remove(local_ogg_path)
+
+@dp.message(F.text & ~F.text.startswith('/'))
+async def handle_text(message: Message):
+    await process_user_request(message, message.text, is_voice=False)
 
 
 async def start_bot() -> Optional[Bot]:
