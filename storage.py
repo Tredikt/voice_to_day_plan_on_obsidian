@@ -47,6 +47,10 @@ class YandexWebDAVStorage(BaseStorage):
                 requests.request("MKCOL", url, auth=self.auth)
 
     def save_day_plan(self, filename: str, structured_plan: str, today_str: str) -> bool:
+        from zoneinfo import ZoneInfo
+        import config
+        tz = ZoneInfo(config.TIMEZONE)
+        now_tz = datetime.datetime.now(tz)
         yandex_file_url = f"{self.webdav_url}{self.obsidian_dir}/{filename}"
         r_get = requests.get(yandex_file_url, auth=self.auth)
         
@@ -54,7 +58,7 @@ class YandexWebDAVStorage(BaseStorage):
             existing_content = r_get.content.decode("utf-8")
             new_content = (
                 f"{existing_content}\n\n"
-                f"---\n### 🕒 Дополнение от {datetime.datetime.now().strftime('%H:%M')}\n\n"
+                f"---\n### 🕒 Дополнение от {now_tz.strftime('%H:%M')}\n\n"
                 f"{structured_plan}"
             )
         else:
@@ -131,13 +135,17 @@ class GoogleDriveStorage(BaseStorage):
 
     def save_day_plan(self, filename: str, structured_plan: str, today_str: str) -> bool:
         from googleapiclient.http import MediaInMemoryUpload
+        from zoneinfo import ZoneInfo
+        import config
+        tz = ZoneInfo(config.TIMEZONE)
+        now_tz = datetime.datetime.now(tz)
         file_id = self._find_file(filename)
         
         if file_id:
             existing_content = self._get_file_content(file_id)
             new_content = (
                 f"{existing_content}\n\n"
-                f"---\n### 🕒 Дополнение от {datetime.datetime.now().strftime('%H:%M')}\n\n"
+                f"---\n### 🕒 Дополнение от {now_tz.strftime('%H:%M')}\n\n"
                 f"{structured_plan}"
             )
             media = MediaInMemoryUpload(new_content.encode('utf-8'), mimetype='text/markdown', resumable=True)

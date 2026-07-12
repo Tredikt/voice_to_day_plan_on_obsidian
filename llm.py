@@ -67,9 +67,13 @@ def parse_target_date(raw_text: str, openai_api_key: str, deepseek_api_key: str)
         target_date: str in 'YYYY-MM-DD' format.
     """
     import datetime
-    today_str = datetime.date.today().strftime("%Y-%m-%d")
-    now = datetime.datetime.now()
-    day_of_week = now.strftime("%A")
+    from zoneinfo import ZoneInfo
+    import config
+
+    tz = ZoneInfo(config.TIMEZONE)
+    now_tz = datetime.datetime.now(tz)
+    today_str = now_tz.strftime("%Y-%m-%d")
+    day_of_week = now_tz.strftime("%A")
     ru_days = {
         "Monday": "Понедельник",
         "Tuesday": "Вторник",
@@ -131,9 +135,14 @@ def generate_day_plan(
         (markdown_text, list_of_events)
     """
     import datetime
+    from zoneinfo import ZoneInfo
+    import config
+    
+    tz = ZoneInfo(config.TIMEZONE)
+    now_tz = datetime.datetime.now(tz)
     
     if not target_date:
-        target_date = datetime.date.today().strftime("%Y-%m-%d")
+        target_date = now_tz.strftime("%Y-%m-%d")
 
     prompt = (
         "Ты — умный личный ассистент. Проанализируй транскрипцию голосовой заметки "
@@ -149,12 +158,12 @@ def generate_day_plan(
             "Пользователь хочет ДОБАВИТЬ новые задачи, ИЗМЕНИТЬ, СДВИНУТЬ или ЗАМЕНИТЬ существующие пункты на основе нового голосового сообщения.\n"
             "Твоя задача — аккуратно объединить или обновить этот план:\n"
             "1. Если пользователь говорит заменить, удалить или сдвинуть задачу/время, внеси эти изменения в существующий текст.\n"
-            "2. Если пользователь говорит добавить задачу, добавь её в список 'Выделенные задачи' (постарайся сохранить красивую структуру). "
+            "2. Если пользователь говорит добавить задачу, добаь её в список 'Выделенные задачи' (постарайся сохранить красивую структуру). "
             "Если новые задачи не привязаны ко времени или это просто дополнения, ты можешь добавить их в список, либо создать в конце файла аккуратный подраздел:\n"
-            f"### 🕒 Дополнение от {datetime.datetime.now().strftime('%H:%M')}\n"
+            f"### 🕒 Дополнение от {now_tz.strftime('%H:%M')}\n"
             "и описать изменения/дополнительный текст там.\n"
             "3. Убери из названий задач глаголы действия вроде 'сделать', 'поставить', 'надо сходить' — пиши лаконично (например: '- [ ] Тренировка в 18:00', '- [ ] Созвон по дизайну').\n"
-            "4. В поле 'markdown' верни ИСПРАВЛЕННЫЙ/ОБНОВЛЕННЫЙ ПОЛНЫЙ текст markdown, который полностью перезапишет старый файл.\n\n"
+            "4. In 'markdown' key return fully updated markdown file.\n\n"
         )
     else:
         prompt += (
