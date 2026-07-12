@@ -1,0 +1,9 @@
+aiogram>=3.0.0
+openai>=1.0.0
+requests
+python-dotenv
+google-api-python-client
+google-auth-httplib2
+google-auth-oauthlib
+aiohttp-socks
+SpeechRecognition
